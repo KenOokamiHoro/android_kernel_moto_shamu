@@ -45,6 +45,7 @@
 #include <linux/bitops.h>
 #include <linux/gfp.h>
 #include <linux/kmemcheck.h>
+#include <linux/nmi.h>
 
 #include <asm/sections.h>
 
@@ -2096,7 +2097,7 @@ static int validate_chain(struct task_struct *curr, struct lockdep_map *lock,
 	 * (If lookup_chain_cache() returns with 1 it acquires
 	 * graph_lock for us)
 	 */
-	if (!hlock->trylock && (hlock->check == 2) &&
+	if (!hlock->trylock && hlock->check &&
 	    lookup_chain_cache(curr, hlock, chain_key)) {
 		/*
 		 * Check whether last held lock:
@@ -3053,9 +3054,6 @@ static int __lock_acquire(struct lockdep_map *lock, unsigned int subclass,
 	int class_idx;
 	u64 chain_key;
 
-	if (!prove_locking)
-		check = 1;
-
 	if (unlikely(!debug_locks))
 		return 0;
 
@@ -3067,8 +3065,8 @@ static int __lock_acquire(struct lockdep_map *lock, unsigned int subclass,
 	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
 		return 0;
 
-	if (lock->key == &__lockdep_no_validate__)
-		check = 1;
+	if (!prove_locking || lock->key == &__lockdep_no_validate__)
+		check = 0;
 
 	if (subclass < NR_LOCKDEP_CACHING_CLASSES)
 		class = lock->class_cache[subclass];
@@ -3136,7 +3134,7 @@ static int __lock_acquire(struct lockdep_map *lock, unsigned int subclass,
 	hlock->holdtime_stamp = lockstat_clock();
 #endif
 
-	if (check == 2 && !mark_irqflags(curr, hlock))
+	if (check && !mark_irqflags(curr, hlock))
 		return 0;
 
 	/* mark it as used: */
@@ -4118,8 +4116,6 @@ EXPORT_SYMBOL_GPL(debug_check_no_locks_held);
 void debug_show_all_locks(void)
 {
 	struct task_struct *g, *p;
-	int count = 10;
-	int unlock = 1;
 
 	if (unlikely(!debug_locks)) {
 		printk("INFO: lockdep is turned off.\n");
@@ -4127,30 +4123,8 @@ void debug_show_all_locks(void)
 	}
 	printk("\nShowing all locks held in the system:\n");
 
-	/*
-	 * Here we try to get the tasklist_lock as hard as possible,
-	 * if not successful after 2 seconds we ignore it (but keep
-	 * trying). This is to enable a debug printout even if a
-	 * tasklist_lock-holding task deadlocks or crashes.
-	 */
-retry:
-	if (!read_trylock(&tasklist_lock)) {
-		if (count == 10)
-			printk("hm, tasklist_lock locked, retrying... ");
-		if (count) {
-			count--;
-			printk(" #%d", 10-count);
-			mdelay(200);
-			goto retry;
-		}
-		printk(" ignoring it.\n");
-		unlock = 0;
-	} else {
-		if (count != 10)
-			printk(KERN_CONT " locked it.\n");
-	}
-
-	do_each_thread(g, p) {
+	rcu_read_lock();
+	for_each_process_thread(g, p) {
 		/*
 		 * It's not reliable to print a task's held locks
 		 * if it's not sleeping (or if it's not the current
@@ -4158,18 +4132,16 @@ retry:
 		 */
 		if (p->state == TASK_RUNNING && p != current)
 			continue;
-		if (p->lockdep_depth)
-			lockdep_print_held_locks(p);
-		if (!unlock)
-			if (read_trylock(&tasklist_lock))
-				unlock = 1;
-	} while_each_thread(g, p);
+		if (!p->lockdep_depth)
+			continue;
+		lockdep_print_held_locks(p);
+		touch_nmi_watchdog();
+		touch_all_softlockup_watchdogs();
+	}
+	rcu_read_unlock();
 
 	printk("\n");
 	printk("=============================================\n\n");
-
-	if (unlock)
-		read_unlock(&tasklist_lock);
 }
 EXPORT_SYMBOL_GPL(debug_show_all_locks);
 
@@ -4224,7 +4196,7 @@ void lockdep_rcu_suspicious(const char *file, const int line, const char *s)
 	printk("\n%srcu_scheduler_active = %d, debug_locks = %d\n",
 	       !rcu_lockdep_current_cpu_online()
 			? "RCU used illegally from offline CPU!\n"
-			: rcu_is_cpu_idle()
+			: !rcu_is_watching()
 				? "RCU used illegally from idle CPU!\n"
 				: "",
 	       rcu_scheduler_active, debug_locks);
@@ -4247,7 +4219,7 @@ void lockdep_rcu_suspicious(const char *file, const int line, const char *s)
 	 * So complain bitterly if someone does call rcu_read_lock(),
 	 * rcu_read_lock_bh() and so on from extended quiescent states.
 	 */
-	if (rcu_is_cpu_idle())
+	if (!rcu_is_watching())
 		printk("RCU used illegally from extended quiescent state!\n");
 
 	lockdep_print_held_locks(curr);
